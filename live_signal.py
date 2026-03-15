@@ -10,7 +10,7 @@ from datetime import datetime
 from hf_storage import load_model_from_hub
 from telegram_notify import send_telegram_message
 
-# Настраиваем логирование
+# Настраиваем логирование – все сообщения будут видны в логах Render
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def get_4h_features(symbol='TON/USDT', limit=100):
@@ -52,27 +52,32 @@ def get_signal():
     и возвращает предсказание модели (0 или 1) и вероятность.
     При сильном сигнале отправляет уведомление в Telegram.
     """
-    logging.info("Начало get_signal()")
+    logging.info("=" * 50)
+    logging.info("Начало работы функции get_signal()")
+    
+    # 1. Загрузка модели
     try:
         model, metadata = load_model_from_hub()
-        logging.info(f"✅ Модель загружена. Точность: {metadata.get('accuracy', 'N/A')}")
+        logging.info(f"✅ Модель успешно загружена. Точность: {metadata.get('accuracy', 'N/A')}")
     except Exception as e:
-        logging.error(f"❌ Не удалось загрузить модель: {e}")
+        logging.error(f"❌ Критическая ошибка: не удалось загрузить модель: {e}")
         return None, None
 
-    logging.info("Получаем 1h данные...")
+    # 2. Получение 1h данных
+    logging.info("Получаем 1h данные с OKX...")
     try:
         exchange = ccxt.okx()
         ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=100)
         df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
         df.set_index('Timestamp', inplace=True)
-        logging.info(f"1h данные получены, {len(df)} свечей")
+        logging.info(f"✅ 1h данные получены, {len(df)} свечей")
     except Exception as e:
-        logging.error(f"Ошибка получения 1h данных: {e}")
+        logging.error(f"❌ Ошибка получения 1h данных: {e}")
         return None, None
 
-    logging.info("Расчёт индикаторов 1h...")
+    # 3. Расчёт индикаторов на 1h
+    logging.info("Расчёт индикаторов на 1h графике...")
     try:
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
@@ -87,11 +92,12 @@ def get_signal():
 
         df['Vol_Change'] = df['Volume'].pct_change() * 100
         df['Price_Change_3h'] = df['Close'].pct_change(3) * 100
-        logging.info("Индикаторы 1h рассчитаны")
+        logging.info("✅ Индикаторы 1h рассчитаны")
     except Exception as e:
-        logging.error(f"Ошибка расчёта индикаторов 1h: {e}")
+        logging.error(f"❌ Ошибка расчёта индикаторов 1h: {e}")
         return None, None
 
+    # 4. Получение 4h признаков
     logging.info("Получаем 4h признаки...")
     df_4h = get_4h_features()
     if not df_4h.empty:
@@ -101,11 +107,13 @@ def get_signal():
             last_4h_features = df_4h_relevant.iloc[-1]
         else:
             last_4h_features = df_4h.iloc[-1]
+        logging.info("✅ 4h признаки получены и сопоставлены")
     else:
         last_4h_features = pd.Series([0.0, 0.0, 0.0, 0.0],
                                       index=['EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h'])
-    logging.info("4h признаки получены")
+        logging.warning("⚠️ 4h данные недоступны, используются нулевые значения")
 
+    # 5. Формирование вектора признаков
     latest = df.iloc[-1]
     features = [
         latest['RSI'],
@@ -119,35 +127,50 @@ def get_signal():
         last_4h_features['ATR_4h'],
         last_4h_features['MACD_Hist_4h']
     ]
-    logging.info(f"Признаки сформированы, длина: {len(features)}")
+    logging.info(f"✅ Признаки сформированы, всего признаков: {len(features)}")
 
     X = np.array(features).reshape(1, -1)
 
+    # 6. Получение предсказания
     try:
         prediction = model.predict(X)[0]
         probability = model.predict_proba(X)[0][1]
-        logging.info(f"Предсказание: {prediction}, вероятность: {probability:.4f}")
+        logging.info(f"📊 Предсказание: {prediction} (0 – нет сигнала, 1 – сигнал), вероятность: {probability:.4f}")
     except Exception as e:
-        logging.error(f"Ошибка при предсказании: {e}")
+        logging.error(f"❌ Ошибка при предсказании: {e}")
         return None, None
 
-    # ПРИНУДИТЕЛЬНЫЙ ТЕСТ: отправляем сообщение в Telegram при каждом запуске (для проверки)
+    # 7. Принудительная тестовая отправка в Telegram (для проверки)
     try:
-        send_telegram_message(f"🔔 Тестовое сообщение от бота\nВероятность сигнала: {probability:.2%}")
-        logging.info("Принудительный тест отправлен")
+        test_message = f"🔔 Тестовое сообщение от бота\nВероятность сигнала: {probability:.2%}"
+        send_result = send_telegram_message(test_message)
+        if send_result:
+            logging.info("✅ Принудительный тест: сообщение успешно отправлено в Telegram")
+        else:
+            logging.error("❌ Принудительный тест: не удалось отправить сообщение в Telegram")
     except Exception as e:
-        logging.error(f"Ошибка при вызове send_telegram_message: {e}")
+        logging.error(f"❌ Исключение при отправке тестового сообщения: {e}")
 
-    # Отправка уведомления, если сигнал сильный
+    # 8. Отправка сигнала, если условие выполнено
     if prediction == 1 and probability > 0.6:
         current_price = latest['Close']
-        message = (f"🚀 <b>СИГНАЛ НА ПОКУПКУ TON/USDT</b>\n"
-                   f"Цена входа: {current_price:.4f}\n"
-                   f"Вероятность: {probability:.2%}\n"
-                   f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        send_telegram_message(message)
+        signal_message = (f"🚀 <b>СИГНАЛ НА ПОКУПКУ TON/USDT</b>\n"
+                          f"Цена входа: {current_price:.4f}\n"
+                          f"Вероятность: {probability:.2%}\n"
+                          f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        try:
+            signal_result = send_telegram_message(signal_message)
+            if signal_result:
+                logging.info("✅ Сигнал отправлен в Telegram")
+            else:
+                logging.error("❌ Не удалось отправить сигнал в Telegram")
+        except Exception as e:
+            logging.error(f"❌ Исключение при отправке сигнала: {e}")
+    else:
+        logging.info("⏺️ Условия для сигнала не выполнены (нет покупки)")
 
-    logging.info("Завершение get_signal()")
+    logging.info("🏁 Завершение работы функции get_signal()")
+    logging.info("=" * 50)
     return prediction, probability
 
 if __name__ == "__main__":
