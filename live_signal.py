@@ -64,7 +64,8 @@ def get_signal():
     """
     Получает последние данные с биржи, вычисляет признаки (включая 4h контекст)
     и возвращает предсказание модели (0 или 1) и вероятность.
-    При сильном сигнале отправляет уведомление в Telegram.
+    При сильном сигнале отправляет уведомление в Telegram с уровнями стоп-лосса и тейк-профита,
+    рассчитанными на основе среднего ATR (если он сохранён в метаданных).
     """
     logging.info("=" * 50)
     logging.info("Начало работы функции get_signal()")
@@ -73,6 +74,12 @@ def get_signal():
     try:
         model, metadata = load_model_from_hub()
         logging.info(f"✅ Модель успешно загружена. Точность: {metadata.get('accuracy', 'N/A')}")
+        # Извлекаем средний ATR, если он сохранён в метаданных
+        atr_mean = metadata.get('atr_mean')
+        if atr_mean:
+            logging.info(f"📊 Средний ATR из метаданных: {atr_mean:.4f}")
+        else:
+            logging.warning("⚠️ Средний ATR не найден в метаданных, уровни стоп-лосса не будут рассчитаны.")
     except Exception as e:
         logging.error(f"❌ Критическая ошибка: не удалось загрузить модель: {e}")
         return None, None
@@ -145,7 +152,10 @@ def get_signal():
     ]
     logging.info(f"✅ Признаки сформированы, всего признаков: {len(features)}")
 
-    X = np.array(features).reshape(1, -1)
+    # Создаём DataFrame с именами признаков (чтобы избежать предупреждения)
+    feature_names = ['RSI', 'ATR', 'BB_Dist_Lower', 'MACD_Hist', 'Vol_Change', 'Price_Change_3h',
+                     'EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h']
+    X = pd.DataFrame([features], columns=feature_names)
 
     # 6. Получение предсказания
     try:
@@ -156,24 +166,24 @@ def get_signal():
         logging.error(f"❌ Ошибка при предсказании: {e}")
         return None, None
 
-    # 7. Принудительная тестовая отправка в Telegram (для проверки)
-    try:
-        test_message = f"🔔 Тестовое сообщение от бота\nВероятность сигнала: {probability:.2%}"
-        send_result = send_telegram_message(test_message)
-        if send_result:
-            logging.info("✅ Принудительный тест: сообщение успешно отправлено в Telegram")
-        else:
-            logging.error("❌ Принудительный тест: не удалось отправить сообщение в Telegram")
-    except Exception as e:
-        logging.error(f"❌ Исключение при отправке тестового сообщения: {e}")
-
-    # 8. Отправка сигнала, если условие выполнено
+    # 7. Отправка сигнала, если условие выполнено
     if prediction == 1 and probability > 0.6:
         current_price = latest['Close']
+        # Формируем базовое сообщение
         signal_message = (f"🚀 <b>СИГНАЛ НА ПОКУПКУ TON/USDT</b>\n"
                           f"Цена входа: {current_price:.4f}\n"
                           f"Вероятность: {probability:.2%}\n"
                           f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        
+        # Если в метаданных есть средний ATR, добавляем уровни стоп-лосса и тейк-профита
+        if atr_mean:
+            stop_loss = current_price - 2 * atr_mean
+            take_profit = current_price + 3 * atr_mean
+            risk_percent = (2 * atr_mean / current_price) * 100
+            reward_percent = (3 * atr_mean / current_price) * 100
+            signal_message += (f"\n\n📉 Стоп-лосс: {stop_loss:.4f} (-{risk_percent:.2f}%)\n"
+                               f"📈 Тейк-профит: {take_profit:.4f} (+{reward_percent:.2f}%)")
+        
         try:
             signal_result = send_telegram_message(signal_message)
             if signal_result:
