@@ -1,5 +1,5 @@
 from sklearn.model_selection import RandomizedSearchCV
-from scipy.stats import randint
+from scipy.stats import randint, uniform
 import datetime
 from datetime import datetime
 from sklearn.metrics import accuracy_score
@@ -8,27 +8,34 @@ from hf_storage import save_model_to_hub, update_historical_data, load_model_fro
 import pandas as pd
 import ccxt
 import pandas_ta as ta
-from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
 from imblearn.over_sampling import SMOTE
 import joblib
 import os
 
-def tune_hyperparameters(X, y):
+def tune_hyperparameters_xgb(X, y):
     """
-    Запускает случайный поиск по сетке гиперпараметров для RandomForest.
+    Запускает случайный поиск по сетке гиперпараметров для XGBoost.
     Возвращает лучшую модель и словарь с лучшими параметрами.
     """
+    # Рассчитываем scale_pos_weight для балансировки классов
+    scale_pos_weight = len(y[y==0]) / len(y[y==1])
+    
     param_dist = {
-        'n_estimators': randint(50, 300),
-        'max_depth': [5, 10, 15, 20, None],
-        'min_samples_split': randint(2, 20),
-        'min_samples_leaf': randint(1, 10),
-        'max_features': ['sqrt', 'log2']
+        'n_estimators': randint(100, 500),
+        'max_depth': randint(3, 10),
+        'learning_rate': uniform(0.01, 0.3),
+        'subsample': uniform(0.6, 0.4),
+        'colsample_bytree': uniform(0.6, 0.4),
+        'min_child_weight': randint(1, 10),
+        'gamma': uniform(0, 0.5)
     }
     
-    base_model = RandomForestClassifier(
+    base_model = xgb.XGBClassifier(
         random_state=42,
-        class_weight='balanced',
+        scale_pos_weight=scale_pos_weight,
+        use_label_encoder=False,
+        eval_metric='logloss',
         n_jobs=-1
     )
     
@@ -43,12 +50,12 @@ def tune_hyperparameters(X, y):
         verbose=1
     )
     
-    print("🔄 Запуск подбора гиперпараметров (может занять 10-20 минут)...")
+    print("🔄 Запуск подбора гиперпараметров XGBoost (может занять 10-20 минут)...")
     random_search.fit(X, y)
     
     best_model = random_search.best_estimator_
     best_params = random_search.best_params_
-    print(f"✅ Лучшие параметры: {best_params}")
+    print(f"✅ Лучшие параметры XGBoost: {best_params}")
     return best_model, best_params
 
 def get_4h_features(symbol='TON/USDT', limit=500):
@@ -67,7 +74,7 @@ def get_4h_features(symbol='TON/USDT', limit=500):
     df_4h['RSI_4h'] = ta.rsi(df_4h['Close'], length=14)
     df_4h['ATR_4h'] = ta.atr(df_4h['High'], df_4h['Low'], df_4h['Close'], length=14)
     
-    # Расчёт MACD и поиск колонки гистограммы
+    # MACD
     macd_4h = ta.macd(df_4h['Close'])
     macdh_col = None
     for col in macd_4h.columns:
@@ -95,7 +102,7 @@ def update_and_train():
         df_old = pd.read_csv(file_name, index_col='Timestamp', parse_dates=True)
         print(f"📊 Найдена база: {len(df_old)} записей.")
         
-        # Удаляем старые 4h колонки, если они есть, чтобы избежать дублирования при merge_asof
+        # Удаляем старые 4h колонки, если они есть
         cols_to_drop = ['EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h']
         existing_cols = [col for col in cols_to_drop if col in df_old.columns]
         if existing_cols:
@@ -126,15 +133,12 @@ def update_and_train():
     print("📈 Скачиваем 4h данные для расчёта контекста...")
     df_4h_features = get_4h_features()
     if not df_4h_features.empty:
-        # Присоединяем к 1h данным: для каждой 1h свечи берём последние доступные 4h индикаторы
         df_combined_sorted = df_combined.sort_index()
         df_4h_sorted = df_4h_features.sort_index()
         
-        # Приводим индексы к единому типу (datetime64[ns])
         df_combined_sorted.index = df_combined_sorted.index.astype('datetime64[ns]')
         df_4h_sorted.index = df_4h_sorted.index.astype('datetime64[ns]')
         
-        # Слияние asof: для каждого момента времени в df_combined берём ближайшую предыдущую 4h запись
         df_combined_with_4h = pd.merge_asof(
             df_combined_sorted, 
             df_4h_sorted, 
@@ -146,7 +150,6 @@ def update_and_train():
     else:
         print("⚠️ Не удалось получить 4h данные, продолжаем без них.")
         df_combined_with_4h = df_combined.copy()
-        # Добавим пустые колонки, чтобы не ломать список признаков
         for col in ['EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h']:
             df_combined_with_4h[col] = float('nan')
     
@@ -174,14 +177,13 @@ def update_and_train():
     df_clean = df_combined.dropna().copy()
     df_clean.to_csv(file_name)
 
-    # 5. ОБУЧЕНИЕ С АВТОТЮНИНГОМ
-    print("🧠 Тренировка нейросети...")
+    # 5. ОБУЧЕНИЕ С АВТОТЮНИНГОМ (XGBoost)
+    print("🧠 Тренировка нейросети XGBoost...")
     features = [
         'RSI', 'ATR', 'BB_Dist_Lower', 'MACD_Hist', 'Vol_Change', 'Price_Change_3h',
         'EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h'
     ]
     
-    # Проверяем наличие всех колонок
     missing_cols = [col for col in features if col not in df_clean.columns]
     if missing_cols:
         print(f"⚠️ Внимание! Отсутствуют колонки: {missing_cols}. Добавляем их с нулями.")
@@ -195,7 +197,11 @@ def update_and_train():
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    # Применяем SMOTE для балансировки классов
+    # Применяем SMOTE (можно оставить или убрать, XGBoost сам может балансировать)
+    # sm = SMOTE(random_state=42)
+    # X_res, y_res = sm.fit_resample(X_train, y_train)
+    # Для XGBoost лучше использовать scale_pos_weight, поэтому SMOTE необязателен, но и не помешает.
+    # Оставим SMOTE для усиления балансировки.
     sm = SMOTE(random_state=42)
     X_res, y_res = sm.fit_resample(X_train, y_train)
 
@@ -224,25 +230,29 @@ def update_and_train():
             print(f"⏳ Последний тюнинг был {days_since_tune} дней назад – используем текущие параметры.")
 
     if need_tuning:
-        model, best_params = tune_hyperparameters(X_res, y_res)
+        model, best_params = tune_hyperparameters_xgb(X_res, y_res)
         metadata['best_params'] = best_params
         metadata['last_tuning_date'] = today.isoformat()
     else:
         if metadata.get('best_params'):
             params = metadata['best_params'].copy()
-            print(f"🔄 Дообучаем модель с параметрами: {params}")
-            model = RandomForestClassifier(
+            print(f"🔄 Дообучаем модель XGBoost с параметрами: {params}")
+            model = xgb.XGBClassifier(
                 random_state=42,
-                class_weight='balanced',
+                use_label_encoder=False,
+                eval_metric='logloss',
                 n_jobs=-1,
                 **params
             )
         else:
-            print("🔄 Используем стандартные параметры (n_estimators=200).")
-            model = RandomForestClassifier(
+            print("🔄 Используем стандартные параметры XGBoost (n_estimators=200).")
+            model = xgb.XGBClassifier(
                 n_estimators=200,
-                class_weight='balanced',
+                max_depth=6,
+                learning_rate=0.1,
                 random_state=42,
+                use_label_encoder=False,
+                eval_metric='logloss',
                 n_jobs=-1
             )
         # Обучаем модель на сбалансированных данных
@@ -251,7 +261,7 @@ def update_and_train():
     # Оцениваем точность на тестовых данных
     y_pred = model.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
-    print(f"🎯 Точность модели: {acc:.4f}")
+    print(f"🎯 Точность модели XGBoost: {acc:.4f}")
 
     # Обновляем метаданные
     metadata['last_training'] = today.isoformat()
@@ -264,7 +274,7 @@ def update_and_train():
 
     # Сохраняем модель и метаданные в Hub
     save_model_to_hub(model, metadata)
-    print(f"🚀 Модель сохранена в Hub! Точность: {acc:.4f}")
+    print(f"🚀 Модель XGBoost сохранена в Hub! Точность: {acc:.4f}")
 
     # Локальное сохранение (опционально)
     joblib.dump(df_clean['ATR'].mean(), 'atr_mean.pkl')

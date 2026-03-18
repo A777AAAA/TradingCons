@@ -8,3 +8,4 @@ joblib
 huggingface_hub
 requests
 mailtrap
+xgboost
