@@ -9,9 +9,9 @@ import os
 import json
 import joblib
 import logging
+import requests
 import numpy as np
 import pandas as pd
-import ccxt
 
 from xgboost          import XGBClassifier
 from sklearn.model_selection import train_test_split
@@ -22,16 +22,6 @@ MODEL_FILE  = "ai_brain.pkl"
 PAPER_FILE  = "paper_trades.json"
 STATS_FILE  = "training_stats.json"
 
-# ✅ ИСПРАВЛЕНО: явно передаём пустые ключи — ccxt не будет читать env
-OKX_CONFIG = {
-    'apiKey':     '',
-    'secret':     '',
-    'password':   '',
-    'options':    {'defaultType': 'spot'},
-    'timeout':    30000,
-    'enableRateLimit': True,
-}
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -39,19 +29,25 @@ logging.basicConfig(
 
 
 # ─────────────────────────────────────────────
-# 1. Загрузка исторических данных с OKX
+# 1. Загрузка исторических данных с OKX (без ccxt)
 # ─────────────────────────────────────────────
-def fetch_ohlcv(symbol="TON/USDT", timeframe="1h", limit=2000) -> pd.DataFrame:
+def fetch_ohlcv(symbol="TON-USDT", timeframe="1H", limit=2000) -> pd.DataFrame:
     try:
-        exchange = ccxt.okx(OKX_CONFIG)
-        ohlcv    = exchange.fetch_ohlcv(
-            symbol, timeframe=timeframe, limit=limit
-        )
-        df = pd.DataFrame(
-            ohlcv, columns=['ts', 'Open', 'High', 'Low', 'Close', 'Volume']
-        )
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
+        r    = requests.get(url, timeout=15)
+        data = r.json().get("data", [])
+        if not data:
+            logging.error("[Trainer] ❌ Пустой ответ от OKX")
+            return pd.DataFrame()
+        df = pd.DataFrame(data, columns=[
+            'ts','Open','High','Low','Close','Volume','VolCcy','VolCcyQuote','Confirm'
+        ])
+        df = df[['ts','Open','High','Low','Close','Volume']].copy()
+        df['ts'] = pd.to_datetime(df['ts'].astype(float), unit='ms')
         df.set_index('ts', inplace=True)
+        for col in ['Open','High','Low','Close','Volume']:
+            df[col] = df[col].astype(float)
+        df = df.sort_index()
         logging.info(f"[Trainer] ✅ Загружено {len(df)} свечей с OKX")
         return df
     except Exception as e:
@@ -92,14 +88,11 @@ def calc_atr(df, period=14):
 def calc_adx(df, period=14):
     up   = df['High'].diff()
     down = -df['Low'].diff()
-
     plus_dm  = up.where((up > down) & (up > 0),    0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
-
     atr      = calc_atr(df, period)
     plus_di  = 100 * (plus_dm.ewm(com=period-1,  min_periods=period).mean() / atr)
     minus_di = 100 * (minus_dm.ewm(com=period-1, min_periods=period).mean() / atr)
-
     dx  = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
     adx = dx.ewm(com=period - 1, min_periods=period).mean()
     return adx
@@ -122,41 +115,25 @@ def calc_volume_ratio(df, period=20):
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
     df['RSI_14'] = calc_rsi(df['Close'], 14)
     df['RSI_7']  = calc_rsi(df['Close'], 7)
-
     df['MACD'], df['MACD_signal'], df['MACD_hist'] = calc_macd(df['Close'])
-
-    atr          = calc_atr(df, 14)
+    atr           = calc_atr(df, 14)
     df['ATR_pct'] = atr / df['Close'] * 100
-
-    df['ADX']    = calc_adx(df, 14)
-    df['BB_pos'] = calc_bollinger(df['Close'])
-
+    df['ADX']     = calc_adx(df, 14)
+    df['BB_pos']  = calc_bollinger(df['Close'])
     df['EMA20']     = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA50']     = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_ratio'] = df['EMA20'] / df['EMA50']
-
     df['Vol_ratio'] = calc_volume_ratio(df)
-
     df['Body_pct']   = (df['Close'] - df['Open']).abs() / df['Open'] * 100
-    df['Upper_wick'] = (
-        df['High'] - df[['Close', 'Open']].max(axis=1)
-    ) / df['Open'] * 100
-    df['Lower_wick'] = (
-        df[['Close', 'Open']].min(axis=1) - df['Low']
-    ) / df['Open'] * 100
-
+    df['Upper_wick'] = (df['High'] - df[['Close', 'Open']].max(axis=1)) / df['Open'] * 100
+    df['Lower_wick'] = (df[['Close', 'Open']].min(axis=1) - df['Low']) / df['Open'] * 100
     df['Return_1h']  = df['Close'].pct_change(1)  * 100
     df['Return_4h']  = df['Close'].pct_change(4)  * 100
     df['Return_12h'] = df['Close'].pct_change(12) * 100
     df['Return_24h'] = df['Close'].pct_change(24) * 100
-
-    df['Target'] = (
-        df['Close'].shift(-8) > df['Close'] * 1.015
-    ).astype(int)
-
+    df['Target'] = (df['Close'].shift(-8) > df['Close'] * 1.015).astype(int)
     return df.dropna()
 
 
@@ -167,15 +144,12 @@ def load_paper_results() -> pd.DataFrame:
     if not os.path.exists(PAPER_FILE):
         logging.info("[Trainer] 📝 Paper trades файл не найден — пропускаем")
         return pd.DataFrame()
-
     with open(PAPER_FILE) as f:
         trades = json.load(f)
-
     closed = [t for t in trades if t["status"] == "CLOSED"]
     if len(closed) < 5:
         logging.info(f"[Trainer] 📝 Мало сделок ({len(closed)}) — пропускаем")
         return pd.DataFrame()
-
     rows = []
     for t in closed:
         rows.append({
@@ -184,11 +158,9 @@ def load_paper_results() -> pd.DataFrame:
             "pnl_pct":    t.get("pnl_pct", 0),
             "Target":     1 if t["result"] == "WIN" else 0,
         })
-
     df     = pd.DataFrame(rows)
     wins   = df['Target'].sum()
     losses = len(df) - wins
-
     logging.info(
         f"[Trainer] 📊 Paper results: "
         f"{len(df)} сделок | WIN: {wins} | LOSS: {losses} | "
@@ -211,10 +183,17 @@ FEATURE_COLS = [
 ]
 
 
-def train_model(symbol="TON/USDT") -> dict:
+def _json_safe(obj):
+    """Конвертирует numpy/float32 типы в стандартные Python типы для JSON"""
+    if hasattr(obj, 'item'):
+        return obj.item()
+    return str(obj)
+
+
+def train_model(symbol="TON-USDT") -> dict:
     logging.info("[Trainer] 🔄 Начало переобучения...")
 
-    df_raw = fetch_ohlcv(symbol, "1h", 2000)
+    df_raw = fetch_ohlcv(symbol, "1H", 2000)
     if df_raw.empty:
         return {"success": False, "error": "Нет данных OKX"}
 
@@ -230,24 +209,14 @@ def train_model(symbol="TON/USDT") -> dict:
 
     if not paper_df.empty:
         paper_winrate = paper_df['Target'].mean()
-
         if paper_winrate < 0.45:
-            logging.info(
-                f"[Trainer] ⚠️ Winrate {paper_winrate:.1%} < 45% "
-                f"— усиливаем примеры LOSS"
-            )
-            loss_mask = (y == 0)
-            sample_weights[loss_mask] *= 1.5
-
+            logging.info(f"[Trainer] ⚠️ Winrate {paper_winrate:.1%} < 45% — усиливаем примеры LOSS")
+            sample_weights[y == 0] *= 1.5
         elif paper_winrate > 0.65:
-            logging.info(
-                f"[Trainer] ✅ Winrate {paper_winrate:.1%} > 65% "
-                f"— модель хорошая, обычное обучение"
-            )
+            logging.info(f"[Trainer] ✅ Winrate {paper_winrate:.1%} > 65% — модель хорошая")
 
     X_train, X_test, y_train, y_test, w_train, _ = train_test_split(
-        X, y, sample_weights,
-        test_size=0.2, random_state=42, shuffle=False
+        X, y, sample_weights, test_size=0.2, random_state=42, shuffle=False
     )
 
     model = XGBClassifier(
@@ -272,39 +241,34 @@ def train_model(symbol="TON/USDT") -> dict:
     )
 
     y_pred    = model.predict(X_test)
-    accuracy  = accuracy_score(y_test, y_pred)
-    precision = precision_score(y_test, y_pred, zero_division=0)
-    recall    = recall_score(y_test, y_pred,    zero_division=0)
+    accuracy  = float(accuracy_score(y_test, y_pred))
+    precision = float(precision_score(y_test, y_pred, zero_division=0))
+    recall    = float(recall_score(y_test, y_pred,    zero_division=0))
 
-    importances  = dict(zip(FEATURE_COLS, model.feature_importances_))
-    top_features = sorted(
-        importances.items(), key=lambda x: x[1], reverse=True
-    )[:5]
+    importances  = dict(zip(FEATURE_COLS, [float(x) for x in model.feature_importances_]))
+    top_features = sorted(importances.items(), key=lambda x: x[1], reverse=True)[:5]
 
     joblib.dump(model, MODEL_FILE)
 
     stats = {
         "trained_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "n_samples":    len(X_train),
+        "n_samples":    int(len(X_train)),
         "accuracy":     round(accuracy,  4),
         "precision":    round(precision, 4),
         "recall":       round(recall,    4),
-        "paper_trades": len(paper_df) if not paper_df.empty else 0,
-        "top_features": top_features,
+        "paper_trades": int(len(paper_df)) if not paper_df.empty else 0,
+        "top_features": [[n, round(float(v), 4)] for n, v in top_features],
         "success":      True,
     }
 
     with open(STATS_FILE, "w") as f:
-        json.dump(stats, f, indent=2)
+        json.dump(stats, f, indent=2, default=_json_safe)
 
     logging.info(
         f"[Trainer] ✅ Модель обучена: "
-        f"Accuracy={accuracy:.1%} | "
-        f"Precision={precision:.1%} | "
-        f"Recall={recall:.1%}"
+        f"Accuracy={accuracy:.1%} | Precision={precision:.1%} | Recall={recall:.1%}"
     )
     logging.info(f"[Trainer] 🏆 Топ признаки: {top_features[:3]}")
-
     return stats
 
 
@@ -315,7 +279,6 @@ def load_model():
     if not os.path.exists(MODEL_FILE):
         logging.info("[Trainer] 🆕 Модели нет — начинаем обучение...")
         train_model()
-
     model = joblib.load(MODEL_FILE)
     logging.info("[Trainer] ✅ Модель загружена")
     return model
