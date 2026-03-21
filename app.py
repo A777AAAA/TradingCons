@@ -13,7 +13,7 @@ from config import (
     SYMBOL, TIMEFRAME, MIN_CONFIDENCE, STRONG_SIGNAL,
     SIGNAL_INTERVAL_MINUTES, validate_config
 )
-from live_signal import get_live_signal
+from live_signal import get_signal, get_live_signal
 from outcome_tracker import (
     open_position, check_position,
     close_position_manual, has_open_position,
