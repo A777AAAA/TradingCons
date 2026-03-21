@@ -1,227 +1,252 @@
 """
-TradeBot - Главный файл запуска
-Связывает все модули в единую систему
+TradeBot v3.0 — Paper Trading Edition
+Главный файл: связывает все модули
 """
 
 import threading
 import time
 import traceback
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 from flask import Flask
 
 from config import (
     SYMBOL, TIMEFRAME, MIN_CONFIDENCE, STRONG_SIGNAL,
     SIGNAL_INTERVAL_MINUTES, validate_config
 )
-from live_signal import get_signal, get_live_signal
-from outcome_tracker import (
+from live_signal       import get_live_signal
+from outcome_tracker   import (
     open_position, check_position,
     close_position_manual, has_open_position,
     get_position_status
 )
 from sentiment_analyzer import get_market_sentiment, sentiment_to_signal_boost
-from weekly_retrainer import run_retrainer_loop
-from telegram_notify import send_message
-from trade_archive import get_statistics
+from telegram_notify    import send_message
+from trade_archive      import get_statistics
+from auto_trainer       import train_model
+from paper_trader       import (
+    open_trade, monitor_trades,
+    get_stats, format_stats_message
+)
+from backtest_engine    import run_backtest, format_backtest_message
+
+logging.basicConfig(
+    level  = logging.INFO,
+    format = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+PAPER_SYMBOL = SYMBOL  # TON/USDT из config
 
 
 # ═══════════════════════════════════════════
-# HEALTHCHECK СЕРВЕР (для Render)
+# HEALTHCHECK СЕРВЕР
 # ═══════════════════════════════════════════
 health_app = Flask(__name__)
 
 @health_app.route("/health")
 def health():
-    return {"status": "ok", "bot": "TradeBot v2.0"}, 200
+    return {"status": "ok", "bot": "TradeBot v3.0"}, 200
 
 @health_app.route("/")
 def index():
-    stats = get_statistics()
-    pos   = get_position_status()
+    stats    = get_statistics()
+    paper    = get_stats()
     return {
-        "bot":      "TradeBot v2.0",
-        "symbol":   SYMBOL,
-        "position": pos,
-        "stats":    stats
+        "bot":          "TradeBot v3.0 — Paper Trading",
+        "symbol":       SYMBOL,
+        "paper_balance": paper["balance"],
+        "paper_winrate": paper["winrate"],
+        "stats":        stats
     }, 200
 
 def run_health_server():
-    health_app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
+    health_app.run(
+        host="0.0.0.0", port=8080,
+        debug=False, use_reloader=False
+    )
 
 
 # ═══════════════════════════════════════════
-# ПРОВЕРКА КОНФИГУРАЦИИ
-# ═══════════════════════════════════════════
-def startup_check():
-    """Проверяет конфигурацию при запуске"""
-    missing = validate_config()
-    if missing:
-        msg = "⚠️ Отсутствуют переменные окружения:\n" + "\n".join(missing)
-        print(f"[App] {msg}")
-        send_message(msg)
-        return False
-
-    print("[App] ✅ Конфигурация проверена")
-    return True
-
-
-# ═══════════════════════════════════════════
-# ОСНОВНОЙ ТОРГОВЫЙ ЦИКЛ
+# ОСНОВНОЙ ТОРГОВЫЙ ЦИКЛ (каждый час)
 # ═══════════════════════════════════════════
 def trading_loop():
-    """
-    Основной цикл бота:
-    1. Получает сигнал от ML модели
-    2. Проверяет настроение рынка
-    3. Открывает/закрывает позиции
-    4. Отправляет уведомления в Telegram
-    """
-    print(f"[App] 🚀 Торговый цикл запущен | {SYMBOL} | {TIMEFRAME}")
+    logger.info(f"🚀 Торговый цикл запущен | {SYMBOL} | {TIMEFRAME}")
 
     while True:
         try:
-            now = datetime.utcnow().strftime("%H:%M UTC")
-            print(f"\n[App] ⏰ Цикл: {now}")
+            now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+            logger.info(f"⏰ Цикл: {now}")
 
-            # ── Шаг 1: Получаем ML сигнал ──────────────────
-            print("[App] Получение сигнала...")
+            # ── Шаг 1: ML сигнал ───────────────────────────
             signal_data = get_live_signal()
-
             if not signal_data:
-                print("[App] ⚠️ Сигнал не получен, пропускаем цикл")
+                logger.warning("⚠️ Сигнал не получен")
                 time.sleep(SIGNAL_INTERVAL_MINUTES * 60)
                 continue
 
-            signal     = signal_data.get("signal", "HOLD")
-            confidence = signal_data.get("confidence", 0.0)
-            price      = signal_data.get("price", 0.0)
+            signal     = signal_data.get("signal",     "HOLD")
+            confidence = signal_data.get("confidence",  0.0)
+            price      = signal_data.get("price",       0.0)
 
-            print(f"[App] 📊 Сигнал: {signal} | Уверенность: {confidence:.1%} | Цена: {price}")
+            logger.info(
+                f"📊 Сигнал: {signal} | "
+                f"Уверенность: {confidence:.1%} | "
+                f"Цена: {price}"
+            )
 
-            # ── Шаг 2: Проверяем открытую позицию ──────────
-            if has_open_position():
-                position_check = check_position(current_price=price)
-                status = position_check.get("status")
+            # ── Шаг 2: Мониторинг Paper сделок ─────────────
+            closed = monitor_trades(PAPER_SYMBOL)
+            for trade in closed:
+                emoji  = "✅" if trade["result"] == "WIN" else "❌"
+                result = "ПРИБЫЛЬ" if trade["result"] == "WIN" else "УБЫТОК"
+                send_message(
+                    f"{emoji} <b>Виртуальная сделка — {result}</b>\n\n"
+                    f"📊 {trade['signal']} {trade['symbol']}\n"
+                    f"🔵 Вход:    <b>${trade['price_open']:.4f}</b>\n"
+                    f"🔴 Выход:   <b>${trade['price_close']:.4f}</b>\n"
+                    f"💰 P&L:     <b>{trade['pnl_pct']:+.2f}%"
+                    f" (${trade['pnl_usd']:+.2f})</b>\n"
+                    f"🏁 Причина: <b>{trade['closed_by']}</b>"
+                )
+                # Статистика после закрытия
+                send_message(format_stats_message(get_stats()))
 
-                if status == "TP":
-                    pnl = position_check.get("pnl", 0)
-                    send_message(
-                        f"✅ <b>ТЕЙК-ПРОФИТ!</b>\n"
-                        f"💰 Прибыль: +{pnl:.2f}%\n"
-                        f"💵 Цена закрытия: {price}"
-                    )
-                    print(f"[App] ✅ TP сработал: +{pnl:.2f}%")
+            # ── Шаг 3: Открытие Paper сделки ───────────────
+            if signal in ("BUY", "SELL") and confidence >= MIN_CONFIDENCE:
 
-                elif status == "SL":
-                    pnl = position_check.get("pnl", 0)
-                    send_message(
-                        f"🛑 <b>СТОП-ЛОСС!</b>\n"
-                        f"📉 Убыток: {pnl:.2f}%\n"
-                        f"💵 Цена закрытия: {price}"
-                    )
-                    print(f"[App] 🛑 SL сработал: {pnl:.2f}%")
+                # Настроение рынка
+                change_24h = signal_data.get("change_24h", 0.0)
+                volume     = signal_data.get("volume",     0.0)
+                sentiment  = get_market_sentiment(price, change_24h, volume)
+                sentiment_str = sentiment.get("sentiment", "neutral")
+                boost         = sentiment_to_signal_boost(sentiment, signal)
+                adj_conf      = min(confidence * boost, 0.99)
 
-                elif status == "OPEN":
-                    current_pnl = position_check.get("pnl", 0)
-                    pos = get_position_status()
-                    print(f"[App] 📈 Позиция открыта: {pos['signal']} | PnL: {current_pnl:+.2f}%")
+                if adj_conf >= MIN_CONFIDENCE:
+                    strength = "🔥 СИЛЬНЫЙ" if adj_conf >= STRONG_SIGNAL else "📊 Обычный"
+                    emoji    = "🟢" if signal == "BUY" else "🔴"
 
-                    # Если новый сигнал противоположный — закрываем
-                    if signal == "SELL" and pos["signal"] == "BUY" and confidence >= MIN_CONFIDENCE:
-                        close_result = close_position_manual(price, reason="SIGNAL")
+                    # Открываем виртуальную сделку
+                    trade = open_trade(signal, price, adj_conf, PAPER_SYMBOL)
+
+                    if trade:
                         send_message(
-                            f"🔄 <b>Позиция закрыта по сигналу</b>\n"
-                            f"📊 Результат: {close_result.get('result')}\n"
-                            f"💰 PnL: {close_result.get('pnl', 0):+.2f}%"
+                            f"{emoji} <b>{signal} {PAPER_SYMBOL}</b> {strength}\n\n"
+                            f"💵 Цена входа:   <b>${price:.4f}</b>\n"
+                            f"✅ Тейк-профит:  <b>${trade['tp']:.4f}</b>\n"
+                            f"🛑 Стоп-лосс:    <b>${trade['sl']:.4f}</b>\n"
+                            f"🎯 Уверенность:  <b>{adj_conf:.1%}</b>\n"
+                            f"🧠 Настроение:   <b>{sentiment_str}</b>\n"
+                            f"📝 Режим:        <b>Paper Trading</b>\n"
+                            f"⏰ Время:        <b>{now}</b>"
                         )
 
-                    elif signal == "BUY" and pos["signal"] == "SELL" and confidence >= MIN_CONFIDENCE:
-                        close_result = close_position_manual(price, reason="SIGNAL")
-                        send_message(
-                            f"🔄 <b>Позиция закрыта по сигналу</b>\n"
-                            f"📊 Результат: {close_result.get('result')}\n"
-                            f"💰 PnL: {close_result.get('pnl', 0):+.2f}%"
-                        )
-
-            # ── Шаг 3: Открываем новую позицию ─────────────
-            if not has_open_position() and signal in ("BUY", "SELL"):
-
-                if confidence >= MIN_CONFIDENCE:
-
-                    # Получаем настроение рынка
-                    change_24h = signal_data.get("change_24h", 0.0)
-                    volume     = signal_data.get("volume", 0.0)
-                    sentiment  = get_market_sentiment(price, change_24h, volume)
-                    sentiment_str = sentiment.get("sentiment", "neutral")
-
-                    # Корректируем уверенность
-                    boost = sentiment_to_signal_boost(sentiment, signal)
-                    adjusted_confidence = min(confidence * boost, 0.99)
-
-                    print(f"[App] 🧠 Настроение: {sentiment_str} | Буст: {boost:.2f}x")
-                    print(f"[App] 📊 Скорректированная уверенность: {adjusted_confidence:.1%}")
-
-                    if adjusted_confidence >= MIN_CONFIDENCE:
-                        # Определяем силу сигнала
-                        strength = "🔥 СИЛЬНЫЙ" if adjusted_confidence >= STRONG_SIGNAL else "📊 Обычный"
-
-                        # Открываем позицию
-                        opened = open_position(
-                            symbol=SYMBOL,
-                            signal=signal,
-                            price=price,
-                            confidence=adjusted_confidence,
-                            sentiment=sentiment_str,
-                            note=f"Буст: {boost:.2f}x"
-                        )
-
-                        if opened:
-                            pos = get_position_status()
-                            emoji = "🟢" if signal == "BUY" else "🔴"
-                            send_message(
-                                f"{emoji} <b>{signal} {SYMBOL}</b> {strength}\n\n"
-                                f"💵 Цена входа:  {price}\n"
-                                f"🛑 Стоп-лосс:  {pos['stop_loss']}\n"
-                                f"✅ Тейк-профит: {pos['take_profit']}\n"
-                                f"🎯 Уверенность: {adjusted_confidence:.1%}\n"
-                                f"🧠 Настроение:  {sentiment_str}\n"
-                                f"⏰ Время:       {now}"
-                            )
-                    else:
-                        print(f"[App] ⏭️ Сигнал после корректировки слабый: {adjusted_confidence:.1%}")
-
-                else:
-                    print(f"[App] ⏭️ Уверенность ниже порога: {confidence:.1%} < {MIN_CONFIDENCE:.1%}")
-
-            # ── Шаг 4: Пауза до следующего цикла ───────────
-            print(f"[App] 💤 Следующий цикл через {SIGNAL_INTERVAL_MINUTES} минут")
+            # ── Шаг 4: Пауза ───────────────────────────────
+            logger.info(f"💤 Следующий цикл через {SIGNAL_INTERVAL_MINUTES} мин")
             time.sleep(SIGNAL_INTERVAL_MINUTES * 60)
 
         except Exception as e:
-            print(f"[App] ❌ Ошибка в торговом цикле: {e}")
+            logger.error(f"❌ Ошибка торгового цикла: {e}")
             traceback.print_exc()
             time.sleep(60)
+
+
+# ═══════════════════════════════════════════
+# ПЕРЕОБУЧЕНИЕ (каждые 6 часов)
+# ═══════════════════════════════════════════
+def retrainer_loop():
+    logger.info("🧠 Retrainer запущен (каждые 6 часов)")
+
+    # Первое обучение сразу при старте
+    time.sleep(30)
+    _do_retrain()
+
+    while True:
+        time.sleep(6 * 60 * 60)
+        _do_retrain()
+
+
+def _do_retrain():
+    try:
+        logger.info("🔄 Переобучение модели...")
+        result = train_model()
+
+        if result.get("success"):
+            top = result.get("top_features", [])
+            top_str = "\n".join(
+                f"  {n:<18} {v:.3f}" for n, v in top[:3]
+            ) if top else "—"
+
+            send_message(
+                f"🧠 <b>Модель переобучена!</b>\n\n"
+                f"✅ Accuracy:    <b>{result['accuracy']:.1%}</b>\n"
+                f"🎯 Precision:   <b>{result['precision']:.1%}</b>\n"
+                f"📊 Recall:      <b>{result['recall']:.1%}</b>\n"
+                f"📚 Примеров:    <b>{result['n_samples']}</b>\n"
+                f"📝 Paper сделок:<b>{result['paper_trades']}</b>\n\n"
+                f"🏆 Топ признаки:\n<code>{top_str}</code>"
+            )
+        else:
+            logger.error(f"Обучение не удалось: {result.get('error')}")
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка retrainer: {e}")
+        traceback.print_exc()
+
+
+# ═══════════════════════════════════════════
+# БЭКТЕСТ (каждые 12 часов)
+# ═══════════════════════════════════════════
+def backtest_loop():
+    logger.info("🔬 Backtest loop запущен (каждые 12 часов)")
+
+    # Первый бэктест через 5 минут после старта
+    time.sleep(5 * 60)
+    _do_backtest()
+
+    while True:
+        time.sleep(12 * 60 * 60)
+        _do_backtest()
+
+
+def _do_backtest():
+    try:
+        logger.info("🔬 Запуск бэктеста...")
+        result = run_backtest(
+            symbol        = PAPER_SYMBOL,
+            limit         = 3000,
+            tp_pct        = 0.03,
+            sl_pct        = 0.015,
+            start_balance = 600.0
+        )
+        send_message(format_backtest_message(result))
+    except Exception as e:
+        logger.error(f"❌ Ошибка бэктеста: {e}")
+        traceback.print_exc()
 
 
 # ═══════════════════════════════════════════
 # ЕЖЕДНЕВНАЯ СТАТИСТИКА
 # ═══════════════════════════════════════════
 def daily_stats_loop():
-    """Отправляет статистику каждые 24 часа"""
     while True:
         try:
             time.sleep(24 * 60 * 60)
-            stats = get_statistics()
+            paper = get_stats()
+            trade = get_statistics()
             send_message(
-                f"📊 <b>Ежедневная статистика</b>\n\n"
-                f"📈 Всего сделок: {stats['total']}\n"
-                f"✅ Прибыльных:  {stats['wins']}\n"
-                f"❌ Убыточных:   {stats['losses']}\n"
-                f"🎯 Винрейт:     {stats['winrate']}%\n"
-                f"💰 Средний PnL: {stats['avg_pnl']:+.2f}%"
+                f"🌅 <b>Ежедневный отчёт</b>\n\n"
+                f"━━━ Paper Trading ━━━\n"
+                + format_stats_message(paper) +
+                f"\n\n━━━ Сигнальная статистика ━━━\n"
+                f"📈 Всего сигналов: <b>{trade['total']}</b>\n"
+                f"✅ Прибыльных:     <b>{trade['wins']}</b>\n"
+                f"❌ Убыточных:      <b>{trade['losses']}</b>\n"
+                f"🎯 Винрейт:        <b>{trade['winrate']}%</b>"
             )
         except Exception as e:
-            print(f"[App] Ошибка статистики: {e}")
+            logger.error(f"❌ Ошибка daily stats: {e}")
             time.sleep(60 * 60)
 
 
@@ -230,37 +255,50 @@ def daily_stats_loop():
 # ═══════════════════════════════════════════
 if __name__ == "__main__":
     print("=" * 50)
-    print("  TradeBot v2.0 — Self-Learning Edition")
+    print("  TradeBot v3.0 — Paper Trading Edition")
     print("=" * 50)
 
-    # Проверка конфигурации
-    if not startup_check():
-        print("[App] ❌ Конфигурация неполная. Проверь переменные окружения на Render.")
+    # Проверка конфига
+    missing = validate_config()
+    if missing:
+        msg = f"⚠️ Отсутствуют переменные:\n" + "\n".join(missing)
+        logger.error(msg)
+        send_message(msg)
         exit(1)
 
-    # Уведомление о запуске
+    logger.info("✅ Конфигурация проверена")
+
+    # Стартовое сообщение
+    paper = get_stats()
     send_message(
-        f"🤖 <b>TradeBot запущен!</b>\n\n"
-        f"📊 Пара:       {SYMBOL}\n"
-        f"⏱️ Таймфрейм: {TIMEFRAME}\n"
-        f"🎯 Мин. уверенность: {MIN_CONFIDENCE:.0%}\n"
-        f"🔄 Переобучение: по воскресеньям в 02:00 UTC"
+        f"🤖 <b>TradeBot v3.0 запущен!</b>\n\n"
+        f"📊 Пара:         <b>{SYMBOL}</b>\n"
+        f"⏱️ Таймфрейм:   <b>{TIMEFRAME}</b>\n"
+        f"📝 Режим:        <b>Paper Trading</b>\n\n"
+        f"💰 Баланс:       <b>${paper['balance']:.2f}</b>\n"
+        f"📋 Сделок:       <b>{paper['total_trades']}</b>\n"
+        f"🎯 Winrate:      <b>{paper['winrate']}%</b>\n\n"
+        f"⏱️ Анализ:       <b>каждый час</b>\n"
+        f"🔄 Обучение:     <b>каждые 6 часов</b>\n"
+        f"🔬 Бэктест:      <b>каждые 12 часов</b>\n"
+        f"📊 Отчёт:        <b>каждые 24 часа</b>"
     )
 
-    # Запускаем потоки
+    # Запускаем все потоки
     threads = [
         threading.Thread(target=trading_loop,      daemon=True, name="TradingLoop"),
-        threading.Thread(target=run_retrainer_loop, daemon=True, name="Retrainer"),
-        threading.Thread(target=daily_stats_loop,   daemon=True, name="DailyStats"),
-        threading.Thread(target=run_health_server,  daemon=True, name="HealthCheck"),
+        threading.Thread(target=retrainer_loop,    daemon=True, name="Retrainer"),
+        threading.Thread(target=backtest_loop,     daemon=True, name="Backtest"),
+        threading.Thread(target=daily_stats_loop,  daemon=True, name="DailyStats"),
+        threading.Thread(target=run_health_server, daemon=True, name="HealthCheck"),
     ]
 
     for t in threads:
         t.start()
-        print(f"[App] ✅ Поток запущен: {t.name}")
+        logger.info(f"✅ Поток запущен: {t.name}")
 
-    print("\n[App] 🚀 Все системы запущены!")
+    logger.info("🚀 Все системы запущены!")
 
-    # Держим главный поток живым
+    # Держим главный поток
     while True:
         time.sleep(60)
