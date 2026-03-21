@@ -11,15 +11,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 MODEL_PATH = "ai_brain.pkl"
 
-# Единая конфигурация exchange — используется везде
 OKX_CONFIG = {
     'options': {'defaultType': 'spot'},
     'timeout': 30000
 }
 
-# ----------------------------------------------------------------------
-# Загрузка модели локально
-# ----------------------------------------------------------------------
+
 def load_model():
     if not os.path.exists(MODEL_PATH):
         logging.warning("⚠️ Модель не найдена — требуется обучение")
@@ -29,16 +26,13 @@ def load_model():
     return model, {}
 
 
-# ----------------------------------------------------------------------
-# Индикаторы вручную (без pandas_ta)
-# ----------------------------------------------------------------------
 def calc_rsi(series, period=14):
-    delta = series.diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
     avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
     avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-    rs = avg_gain / avg_loss
+    rs       = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 
@@ -70,13 +64,10 @@ def calc_bb_dist_lower(series, period=20, std=2):
     return (lower - series) / series * 100
 
 
-# ----------------------------------------------------------------------
-# 4h признаки
-# ----------------------------------------------------------------------
 def get_4h_features(symbol='TON/USDT', limit=100):
     logging.info("Начинаем получение 4h данных...")
     try:
-        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО
+        exchange = ccxt.okx(OKX_CONFIG)
         ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=limit)
         df = pd.DataFrame(ohlcv_4h, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
@@ -94,14 +85,14 @@ def get_4h_features(symbol='TON/USDT', limit=100):
         return pd.DataFrame(columns=['EMA50_4h', 'RSI_4h', 'ATR_4h', 'MACD_Hist_4h'])
 
 
-# ----------------------------------------------------------------------
-# BTC контекст
-# ----------------------------------------------------------------------
 def get_btc_context_live(limit=100):
     try:
-        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО
+        exchange  = ccxt.okx(OKX_CONFIG)
         btc_ohlcv = exchange.fetch_ohlcv('BTC/USDT', timeframe='1h', limit=limit)
-        df_btc = pd.DataFrame(btc_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        df_btc    = pd.DataFrame(
+            btc_ohlcv,
+            columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
+        )
         df_btc['Timestamp'] = pd.to_datetime(df_btc['Timestamp'], unit='ms')
         df_btc.set_index('Timestamp', inplace=True)
         df_btc['BTC_pct_1h'] = df_btc['Close'].pct_change() * 100
@@ -112,24 +103,21 @@ def get_btc_context_live(limit=100):
         return pd.DataFrame()
 
 
-# ----------------------------------------------------------------------
-# Подготовка признаков
-# ----------------------------------------------------------------------
 def prepare_realtime_features(df_1h_raw, df_4h_features):
     df = df_1h_raw.copy()
 
-    df['RSI']            = calc_rsi(df['Close'], 14)
-    df['ATR']            = calc_atr(df['High'], df['Low'], df['Close'], 14)
-    df['BB_Dist_Lower']  = calc_bb_dist_lower(df['Close'], 20, 2)
-    df['MACD_Hist']      = calc_macd_hist(df['Close'])
-    df['Vol_Change']     = df['Volume'].pct_change() * 100
-    df['Price_Change_3h']= df['Close'].pct_change(3) * 100
-    df['EMA20']          = calc_ema(df['Close'], 20)
-    df['EMA50']          = calc_ema(df['Close'], 50)
-    df['RSI7']           = calc_rsi(df['Close'], 7)
-    df['Volume_SMA5']    = df['Volume'].rolling(window=5).mean()
-    df['High_Low_pct']   = (df['High'] - df['Low']) / df['Close'] * 100
-    df['Close_shift_1']  = df['Close'].shift(1)
+    df['RSI']             = calc_rsi(df['Close'], 14)
+    df['ATR']             = calc_atr(df['High'], df['Low'], df['Close'], 14)
+    df['BB_Dist_Lower']   = calc_bb_dist_lower(df['Close'], 20, 2)
+    df['MACD_Hist']       = calc_macd_hist(df['Close'])
+    df['Vol_Change']      = df['Volume'].pct_change() * 100
+    df['Price_Change_3h'] = df['Close'].pct_change(3) * 100
+    df['EMA20']           = calc_ema(df['Close'], 20)
+    df['EMA50']           = calc_ema(df['Close'], 50)
+    df['RSI7']            = calc_rsi(df['Close'], 7)
+    df['Volume_SMA5']     = df['Volume'].rolling(window=5).mean()
+    df['High_Low_pct']    = (df['High'] - df['Low']) / df['Close'] * 100
+    df['Close_shift_1']   = df['Close'].shift(1)
 
     df_btc = get_btc_context_live(limit=len(df) + 10)
 
@@ -171,9 +159,6 @@ def prepare_realtime_features(df_1h_raw, df_4h_features):
     return X
 
 
-# ----------------------------------------------------------------------
-# Основная функция
-# ----------------------------------------------------------------------
 def get_signal():
     logging.info("=" * 50)
     logging.info("Начало работы get_signal()")
@@ -186,9 +171,12 @@ def get_signal():
     atr_mean = metadata.get('atr_mean')
 
     try:
-        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО
-        ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=150)
-        df_1h = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        exchange = ccxt.okx(OKX_CONFIG)
+        ohlcv    = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=150)
+        df_1h    = pd.DataFrame(
+            ohlcv,
+            columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
+        )
         df_1h['Timestamp'] = pd.to_datetime(df_1h['Timestamp'], unit='ms')
         df_1h.set_index('Timestamp', inplace=True)
         logging.info(f"✅ 1h данные получены, {len(df_1h)} свечей")
@@ -229,22 +217,30 @@ def get_signal():
     return pred, prob
 
 
-# ----------------------------------------------------------------------
-# Обёртка для app.py
-# ----------------------------------------------------------------------
 def get_live_signal():
     """Возвращает словарь вместо tuple для использования в app.py"""
     try:
-        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО
-        ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=5)
-        current_price = ohlcv[-1][4]
+        exchange = ccxt.okx(OKX_CONFIG)
+        ohlcv    = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=5)
 
-        change_24h_ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1d', limit=2)
-        change_24h = (
-            (change_24h_ohlcv[-1][4] - change_24h_ohlcv[-2][4])
-            / change_24h_ohlcv[-2][4] * 100
+        # ✅ ИСПРАВЛЕНО: защита от None в текущей цене
+        current_price = (
+            float(ohlcv[-1][4])
+            if ohlcv and ohlcv[-1][4] is not None
+            else 0.0
         )
-        volume = change_24h_ohlcv[-1][5]
+
+        # ✅ ИСПРАВЛЕНО: limit=3 + фильтр None чтобы избежать незакрытой свечи
+        change_24h_ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1d', limit=3)
+        valid = [c for c in change_24h_ohlcv if c[4] is not None]
+
+        if len(valid) >= 2:
+            change_24h = (valid[-1][4] - valid[-2][4]) / valid[-2][4] * 100
+            volume     = float(valid[-1][5]) if valid[-1][5] is not None else 0.0
+        else:
+            change_24h = 0.0
+            volume     = 0.0
+
     except Exception as e:
         logging.error(f"Ошибка получения цены: {e}")
         current_price = 0.0
@@ -267,9 +263,6 @@ def get_live_signal():
     }
 
 
-# ----------------------------------------------------------------------
-# Тестовый запуск
-# ----------------------------------------------------------------------
 if __name__ == "__main__":
     p, pr = get_signal()
     if p is not None:
