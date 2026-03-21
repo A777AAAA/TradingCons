@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 import logging
+import os
 from datetime import datetime, timezone
 from flask import Flask
 
@@ -14,12 +15,7 @@ from config import (
     SYMBOL, TIMEFRAME, MIN_CONFIDENCE, STRONG_SIGNAL,
     SIGNAL_INTERVAL_MINUTES, validate_config
 )
-from live_signal       import get_live_signal
-from outcome_tracker   import (
-    open_position, check_position,
-    close_position_manual, has_open_position,
-    get_position_status
-)
+from live_signal        import get_live_signal
 from sentiment_analyzer import get_market_sentiment, sentiment_to_signal_boost
 from telegram_notify    import send_message
 from trade_archive      import get_statistics
@@ -50,20 +46,24 @@ def health():
 
 @health_app.route("/")
 def index():
-    stats    = get_statistics()
-    paper    = get_stats()
+    stats = get_statistics()
+    paper = get_stats()
     return {
-        "bot":          "TradeBot v3.0 — Paper Trading",
-        "symbol":       SYMBOL,
+        "bot":           "TradeBot v3.0 — Paper Trading",
+        "symbol":        SYMBOL,
         "paper_balance": paper["balance"],
         "paper_winrate": paper["winrate"],
-        "stats":        stats
+        "stats":         stats
     }, 200
 
 def run_health_server():
+    # ✅ ИСПРАВЛЕНО: берём PORT из env (Render требует это)
+    port = int(os.environ.get("PORT", 8080))
     health_app.run(
-        host="0.0.0.0", port=8080,
-        debug=False, use_reloader=False
+        host        = "0.0.0.0",
+        port        = port,
+        debug       = False,
+        use_reloader= False
     )
 
 
@@ -79,9 +79,11 @@ def trading_loop():
             logger.info(f"⏰ Цикл: {now}")
 
             # ── Шаг 1: ML сигнал ───────────────────────────
+            logger.info("🔍 Шаг 1: get_live_signal()")
             signal_data = get_live_signal()
+
             if not signal_data:
-                logger.warning("⚠️ Сигнал не получен")
+                logger.warning("⚠️ Сигнал не получен — модель ещё обучается")
                 time.sleep(SIGNAL_INTERVAL_MINUTES * 60)
                 continue
 
@@ -96,7 +98,9 @@ def trading_loop():
             )
 
             # ── Шаг 2: Мониторинг Paper сделок ─────────────
+            logger.info("🔍 Шаг 2: monitor_trades()")
             closed = monitor_trades(PAPER_SYMBOL)
+
             for trade in closed:
                 emoji  = "✅" if trade["result"] == "WIN" else "❌"
                 result = "ПРИБЫЛЬ" if trade["result"] == "WIN" else "УБЫТОК"
@@ -109,25 +113,31 @@ def trading_loop():
                     f" (${trade['pnl_usd']:+.2f})</b>\n"
                     f"🏁 Причина: <b>{trade['closed_by']}</b>"
                 )
-                # Статистика после закрытия
                 send_message(format_stats_message(get_stats()))
 
             # ── Шаг 3: Открытие Paper сделки ───────────────
+            logger.info("🔍 Шаг 3: проверка сигнала")
             if signal in ("BUY", "SELL") and confidence >= MIN_CONFIDENCE:
 
-                # Настроение рынка
-                change_24h = signal_data.get("change_24h", 0.0)
-                volume     = signal_data.get("volume",     0.0)
-                sentiment  = get_market_sentiment(price, change_24h, volume)
-                sentiment_str = sentiment.get("sentiment", "neutral")
-                boost         = sentiment_to_signal_boost(sentiment, signal)
-                adj_conf      = min(confidence * boost, 0.99)
+                change_24h    = signal_data.get("change_24h", 0.0)
+                volume        = signal_data.get("volume",     0.0)
+
+                # ✅ ИСПРАВЛЕНО: защита если sentiment_analyzer упал
+                try:
+                    sentiment     = get_market_sentiment(price, change_24h, volume)
+                    sentiment_str = sentiment.get("sentiment", "neutral")
+                    boost         = sentiment_to_signal_boost(sentiment, signal)
+                except Exception as se:
+                    logger.warning(f"⚠️ Sentiment error: {se} — используем нейтральный")
+                    sentiment_str = "neutral"
+                    boost         = 1.0
+
+                adj_conf = min(confidence * boost, 0.99)
 
                 if adj_conf >= MIN_CONFIDENCE:
                     strength = "🔥 СИЛЬНЫЙ" if adj_conf >= STRONG_SIGNAL else "📊 Обычный"
                     emoji    = "🟢" if signal == "BUY" else "🔴"
 
-                    # Открываем виртуальную сделку
                     trade = open_trade(signal, price, adj_conf, PAPER_SYMBOL)
 
                     if trade:
@@ -158,7 +168,7 @@ def trading_loop():
 def retrainer_loop():
     logger.info("🧠 Retrainer запущен (каждые 6 часов)")
 
-    # Первое обучение сразу при старте
+    # Первое обучение через 30 сек после старта
     time.sleep(30)
     _do_retrain()
 
@@ -173,22 +183,24 @@ def _do_retrain():
         result = train_model()
 
         if result.get("success"):
-            top = result.get("top_features", [])
+            top     = result.get("top_features", [])
             top_str = "\n".join(
                 f"  {n:<18} {v:.3f}" for n, v in top[:3]
             ) if top else "—"
 
             send_message(
                 f"🧠 <b>Модель переобучена!</b>\n\n"
-                f"✅ Accuracy:    <b>{result['accuracy']:.1%}</b>\n"
-                f"🎯 Precision:   <b>{result['precision']:.1%}</b>\n"
-                f"📊 Recall:      <b>{result['recall']:.1%}</b>\n"
-                f"📚 Примеров:    <b>{result['n_samples']}</b>\n"
-                f"📝 Paper сделок:<b>{result['paper_trades']}</b>\n\n"
+                f"✅ Accuracy:     <b>{result['accuracy']:.1%}</b>\n"
+                f"🎯 Precision:    <b>{result['precision']:.1%}</b>\n"
+                f"📊 Recall:       <b>{result['recall']:.1%}</b>\n"
+                f"📚 Примеров:     <b>{result['n_samples']}</b>\n"
+                f"📝 Paper сделок: <b>{result['paper_trades']}</b>\n\n"
                 f"🏆 Топ признаки:\n<code>{top_str}</code>"
             )
         else:
-            logger.error(f"Обучение не удалось: {result.get('error')}")
+            err = result.get("error", "unknown")
+            logger.error(f"Обучение не удалось: {err}")
+            send_message(f"⚠️ <b>Обучение не удалось</b>\n\n{err}")
 
     except Exception as e:
         logger.error(f"❌ Ошибка retrainer: {e}")
@@ -201,8 +213,8 @@ def _do_retrain():
 def backtest_loop():
     logger.info("🔬 Backtest loop запущен (каждые 12 часов)")
 
-    # Первый бэктест через 5 минут после старта
-    time.sleep(5 * 60)
+    # Первый бэктест через 10 минут (после обучения)
+    time.sleep(10 * 60)
     _do_backtest()
 
     while True:

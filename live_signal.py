@@ -5,15 +5,17 @@ import numpy as np
 import joblib
 import os
 from datetime import datetime
-from telegram_notify import send_telegram_message
+from telegram_notify import send_message
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 MODEL_PATH = "ai_brain.pkl"
 
+# ✅ ИСПРАВЛЕНО: OKX публичный API — ключи не нужны совсем
 OKX_CONFIG = {
     'options': {'defaultType': 'spot'},
-    'timeout': 30000
+    'timeout': 30000,
+    'enableRateLimit': True,
 }
 
 
@@ -69,7 +71,10 @@ def get_4h_features(symbol='TON/USDT', limit=100):
     try:
         exchange = ccxt.okx(OKX_CONFIG)
         ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=limit)
-        df = pd.DataFrame(ohlcv_4h, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        df = pd.DataFrame(
+            ohlcv_4h,
+            columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
+        )
         df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
         df.set_index('Timestamp', inplace=True)
 
@@ -127,9 +132,9 @@ def prepare_realtime_features(df_1h_raw, df_4h_features):
     df_merged = pd.merge_asof(
         df.sort_index(),
         df_4h_features.sort_index(),
-        left_index=True,
-        right_index=True,
-        direction='backward'
+        left_index  = True,
+        right_index = True,
+        direction   = 'backward'
     )
 
     if not df_btc.empty:
@@ -137,9 +142,9 @@ def prepare_realtime_features(df_1h_raw, df_4h_features):
         df_merged = pd.merge_asof(
             df_merged.sort_index(),
             df_btc.sort_index(),
-            left_index=True,
-            right_index=True,
-            direction='backward'
+            left_index  = True,
+            right_index = True,
+            direction   = 'backward'
         )
     else:
         df_merged['BTC_pct_1h'] = 0.0
@@ -207,7 +212,9 @@ def get_signal():
             sl  = current_price - 2 * atr_mean
             tp  = current_price + 3 * atr_mean
             msg += f"\n\n📉 Стоп-лосс: {sl:.4f}\n📈 Тейк-профит: {tp:.4f}"
-        send_telegram_message(msg)
+
+        # ✅ ИСПРАВЛЕНО: используем send_message вместо send_telegram_message
+        send_message(msg)
         logging.info("✅ Сигнал отправлен в Telegram")
     else:
         logging.info("⏺️ Нет сигнала")
@@ -218,19 +225,19 @@ def get_signal():
 
 
 def get_live_signal():
-    """Возвращает словарь вместо tuple для использования в app.py"""
+    """Возвращает словарь для использования в app.py"""
     try:
-        exchange = ccxt.okx(OKX_CONFIG)
-        ohlcv    = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=5)
+        exchange      = ccxt.okx(OKX_CONFIG)
+        ohlcv         = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=5)
 
-        # ✅ ИСПРАВЛЕНО: защита от None в текущей цене
+        # ✅ ИСПРАВЛЕНО: защита от None
         current_price = (
             float(ohlcv[-1][4])
             if ohlcv and ohlcv[-1][4] is not None
             else 0.0
         )
 
-        # ✅ ИСПРАВЛЕНО: limit=3 + фильтр None чтобы избежать незакрытой свечи
+        # ✅ ИСПРАВЛЕНО: limit=3 + фильтр None
         change_24h_ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1d', limit=3)
         valid = [c for c in change_24h_ohlcv if c[4] is not None]
 
