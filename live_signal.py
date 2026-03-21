@@ -11,10 +11,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 MODEL_PATH = "ai_brain.pkl"
 
-# ✅ ИСПРАВЛЕНО: OKX публичный API — ключи не нужны совсем
+# ✅ ИСПРАВЛЕНО: явно передаём пустые ключи — ccxt не читает env
 OKX_CONFIG = {
-    'options': {'defaultType': 'spot'},
-    'timeout': 30000,
+    'apiKey':   '',
+    'secret':   '',
+    'password': '',
+    'options':  {'defaultType': 'spot'},
+    'timeout':  30000,
     'enableRateLimit': True,
 }
 
@@ -213,7 +216,6 @@ def get_signal():
             tp  = current_price + 3 * atr_mean
             msg += f"\n\n📉 Стоп-лосс: {sl:.4f}\n📈 Тейк-профит: {tp:.4f}"
 
-        # ✅ ИСПРАВЛЕНО: используем send_message вместо send_telegram_message
         send_message(msg)
         logging.info("✅ Сигнал отправлен в Telegram")
     else:
@@ -230,14 +232,12 @@ def get_live_signal():
         exchange      = ccxt.okx(OKX_CONFIG)
         ohlcv         = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=5)
 
-        # ✅ ИСПРАВЛЕНО: защита от None
         current_price = (
             float(ohlcv[-1][4])
             if ohlcv and ohlcv[-1][4] is not None
             else 0.0
         )
 
-        # ✅ ИСПРАВЛЕНО: limit=3 + фильтр None
         change_24h_ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1d', limit=3)
         valid = [c for c in change_24h_ohlcv if c[4] is not None]
 
