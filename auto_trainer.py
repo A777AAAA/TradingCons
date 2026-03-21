@@ -22,6 +22,12 @@ MODEL_FILE  = "ai_brain.pkl"
 PAPER_FILE  = "paper_trades.json"
 STATS_FILE  = "training_stats.json"
 
+# Единая конфигурация exchange  ✅ ИСПРАВЛЕНО
+OKX_CONFIG = {
+    'options': {'defaultType': 'spot'},
+    'timeout': 30000
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -33,9 +39,9 @@ logging.basicConfig(
 # ─────────────────────────────────────────────
 def fetch_ohlcv(symbol="TON/USDT", timeframe="1h", limit=2000) -> pd.DataFrame:
     try:
-        exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
+        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО: spot вместо swap
         ohlcv    = exchange.fetch_ohlcv(
-            symbol + ":USDT", timeframe=timeframe, limit=limit
+            symbol, timeframe=timeframe, limit=limit  # ✅ ИСПРАВЛЕНО: убрали ":USDT"
         )
         df = pd.DataFrame(
             ohlcv, columns=['ts', 'Open', 'High', 'Low', 'Close', 'Volume']
@@ -101,7 +107,6 @@ def calc_bollinger(series, period=20, std=2):
     stddev = series.rolling(period).std()
     upper  = sma + std * stddev
     lower  = sma - std * stddev
-    # Позиция цены внутри полос (0 = нижняя, 1 = верхняя)
     width  = upper - lower
     pos    = (series - lower) / width.replace(0, np.nan)
     return pos.fillna(0.5)
@@ -116,43 +121,33 @@ def calc_volume_ratio(df, period=20):
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # RSI разных периодов
     df['RSI_14']  = calc_rsi(df['Close'], 14)
     df['RSI_7']   = calc_rsi(df['Close'], 7)
 
-    # MACD
     df['MACD'], df['MACD_signal'], df['MACD_hist'] = calc_macd(df['Close'])
 
-    # ATR (нормализованный)
     atr = calc_atr(df, 14)
     df['ATR_pct'] = atr / df['Close'] * 100
 
-    # ADX — сила тренда
     df['ADX'] = calc_adx(df, 14)
 
-    # Bollinger — позиция цены
     df['BB_pos'] = calc_bollinger(df['Close'])
 
-    # EMA
     df['EMA20']  = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA50']  = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA_ratio'] = df['EMA20'] / df['EMA50']  # > 1 = аптренд
+    df['EMA_ratio'] = df['EMA20'] / df['EMA50']
 
-    # Объём
     df['Vol_ratio'] = calc_volume_ratio(df)
 
-    # Свечные паттерны
-    df['Body_pct']  = (df['Close'] - df['Open']).abs() / df['Open'] * 100
+    df['Body_pct']   = (df['Close'] - df['Open']).abs() / df['Open'] * 100
     df['Upper_wick'] = (df['High'] - df[['Close','Open']].max(axis=1)) / df['Open'] * 100
     df['Lower_wick'] = (df[['Close','Open']].min(axis=1) - df['Low'])  / df['Open'] * 100
 
-    # Изменение цены
     df['Return_1h']  = df['Close'].pct_change(1)  * 100
     df['Return_4h']  = df['Close'].pct_change(4)  * 100
     df['Return_12h'] = df['Close'].pct_change(12) * 100
     df['Return_24h'] = df['Close'].pct_change(24) * 100
 
-    # ТАРГЕТ: вырастет ли цена на >1.5% за следующие 8 свечей?
     df['Target'] = (
         df['Close'].shift(-8) > df['Close'] * 1.015
     ).astype(int)
@@ -164,10 +159,6 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 # 3. Загрузка результатов Paper Trading
 # ─────────────────────────────────────────────
 def load_paper_results() -> pd.DataFrame:
-    """
-    Загружает закрытые виртуальные сделки.
-    Преобразует их в обучающие примеры.
-    """
     if not os.path.exists(PAPER_FILE):
         logging.info("[Trainer] 📝 Paper trades файл не найден — пропускаем")
         return pd.DataFrame()
@@ -183,11 +174,9 @@ def load_paper_results() -> pd.DataFrame:
     rows = []
     for t in closed:
         rows.append({
-            # Используем уверенность модели как признак
             "confidence":  t.get("confidence", 50) / 100,
             "signal_buy":  1 if t["signal"] == "BUY" else 0,
             "pnl_pct":     t.get("pnl_pct", 0),
-            # WIN = 1, LOSS = 0
             "Target":      1 if t["result"] == "WIN" else 0,
         })
 
@@ -220,7 +209,6 @@ FEATURE_COLS = [
 def train_model(symbol="TON/USDT") -> dict:
     logging.info("[Trainer] 🔄 Начало переобучения...")
 
-    # --- Исторические данные ---
     df_raw = fetch_ohlcv(symbol, "1h", 2000)
     if df_raw.empty:
         return {"success": False, "error": "Нет данных OKX"}
@@ -232,21 +220,17 @@ def train_model(symbol="TON/USDT") -> dict:
     X = df[FEATURE_COLS].values
     y = df['Target'].values
 
-    # --- Paper Trading результаты (веса) ---
     paper_df = load_paper_results()
     sample_weights = np.ones(len(X))
 
     if not paper_df.empty:
-        # Если много проигрышей — увеличиваем вес похожих исторических примеров
         paper_winrate = paper_df['Target'].mean()
 
         if paper_winrate < 0.45:
-            # Модель ошибается чаще — усиливаем примеры где она была неправа
             logging.info(
                 f"[Trainer] ⚠️ Winrate {paper_winrate:.1%} < 45% "
                 f"— усиливаем примеры LOSS"
             )
-            # Увеличиваем вес строк где цена НЕ выросла
             loss_mask = (y == 0)
             sample_weights[loss_mask] *= 1.5
 
@@ -256,13 +240,11 @@ def train_model(symbol="TON/USDT") -> dict:
                 f"— модель хорошая, обычное обучение"
             )
 
-    # --- Разделение на train/test ---
     X_train, X_test, y_train, y_test, w_train, _ = train_test_split(
         X, y, sample_weights, test_size=0.2,
         random_state=42, shuffle=False
     )
 
-    # --- XGBoost ---
     model = XGBClassifier(
         n_estimators     = 300,
         max_depth        = 5,
@@ -284,20 +266,16 @@ def train_model(symbol="TON/USDT") -> dict:
         verbose          = False,
     )
 
-    # --- Метрики ---
     y_pred    = model.predict(X_test)
     accuracy  = accuracy_score(y_test, y_pred)
     precision = precision_score(y_test, y_pred, zero_division=0)
     recall    = recall_score(y_test, y_pred,    zero_division=0)
 
-    # --- Важность признаков ---
     importances = dict(zip(FEATURE_COLS, model.feature_importances_))
     top_features = sorted(importances.items(), key=lambda x: x[1], reverse=True)[:5]
 
-    # --- Сохранение модели ---
     joblib.dump(model, MODEL_FILE)
 
-    # --- Статистика обучения ---
     stats = {
         "trained_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "n_samples":    len(X_train),

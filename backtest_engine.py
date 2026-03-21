@@ -10,13 +10,19 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Единая конфигурация exchange  ✅ ИСПРАВЛЕНО
+OKX_CONFIG = {
+    'options': {'defaultType': 'spot'},
+    'timeout': 30000
+}
+
 
 def fetch_history(symbol="TON/USDT",
                   timeframe="1h", limit=3000) -> pd.DataFrame:
     try:
-        exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
+        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО: spot вместо swap
         ohlcv    = exchange.fetch_ohlcv(
-            symbol + ":USDT", timeframe=timeframe, limit=limit
+            symbol, timeframe=timeframe, limit=limit  # ✅ ИСПРАВЛЕНО: убрали ":USDT"
         )
         df = pd.DataFrame(
             ohlcv,

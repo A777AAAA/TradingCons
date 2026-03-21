@@ -11,6 +11,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 MODEL_PATH = "ai_brain.pkl"
 
+# Единая конфигурация exchange — используется везде
+OKX_CONFIG = {
+    'options': {'defaultType': 'spot'},
+    'timeout': 30000
+}
 
 # ----------------------------------------------------------------------
 # Загрузка модели локально
@@ -71,7 +76,7 @@ def calc_bb_dist_lower(series, period=20, std=2):
 def get_4h_features(symbol='TON/USDT', limit=100):
     logging.info("Начинаем получение 4h данных...")
     try:
-        exchange = ccxt.okx({'timeout': 30000})
+        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО
         ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=limit)
         df = pd.DataFrame(ohlcv_4h, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
@@ -94,7 +99,7 @@ def get_4h_features(symbol='TON/USDT', limit=100):
 # ----------------------------------------------------------------------
 def get_btc_context_live(limit=100):
     try:
-        exchange = ccxt.okx()
+        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО
         btc_ohlcv = exchange.fetch_ohlcv('BTC/USDT', timeframe='1h', limit=limit)
         df_btc = pd.DataFrame(btc_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         df_btc['Timestamp'] = pd.to_datetime(df_btc['Timestamp'], unit='ms')
@@ -173,7 +178,6 @@ def get_signal():
     logging.info("=" * 50)
     logging.info("Начало работы get_signal()")
 
-    # Загружаем модель локально
     model, metadata = load_model()
     if model is None:
         logging.error("❌ Модель не найдена. Запустите обучение.")
@@ -182,7 +186,7 @@ def get_signal():
     atr_mean = metadata.get('atr_mean')
 
     try:
-        exchange = ccxt.okx()
+        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО
         ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=150)
         df_1h = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         df_1h['Timestamp'] = pd.to_datetime(df_1h['Timestamp'], unit='ms')
@@ -231,7 +235,7 @@ def get_signal():
 def get_live_signal():
     """Возвращает словарь вместо tuple для использования в app.py"""
     try:
-        exchange = ccxt.okx()
+        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО
         ohlcv = exchange.fetch_ohlcv('TON/USDT', timeframe='1h', limit=5)
         current_price = ohlcv[-1][4]
 
