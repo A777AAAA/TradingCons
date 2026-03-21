@@ -17,6 +17,12 @@ TRADE_PCT       = 0.10   # 10% от баланса
 TP_PCT          = 0.03   # +3% тейк-профит
 SL_PCT          = 0.015  # -1.5% стоп-лосс
 
+# Единая конфигурация exchange  ✅ ИСПРАВЛЕНО
+OKX_CONFIG = {
+    'options': {'defaultType': 'spot'},
+    'timeout': 30000
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,7 +71,7 @@ def save_trades(trades: list):
 # ─────────────────────────────────────────────
 def get_current_price(symbol="TON/USDT") -> float:
     try:
-        exchange = ccxt.okx()
+        exchange = ccxt.okx(OKX_CONFIG)  # ✅ ИСПРАВЛЕНО
         ticker   = exchange.fetch_ticker(symbol)
         return float(ticker['last'])
     except Exception as e:
