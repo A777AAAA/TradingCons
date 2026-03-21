@@ -1,17 +1,52 @@
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 import ccxt
-import time
 import joblib
 import os
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 from xgboost import XGBClassifier
 
-MODEL_PATH  = "ai_brain.pkl"
-SCALER_PATH = "scaler.pkl"
+MODEL_PATH = "ai_brain.pkl"
 
 
+# ----------------------------------------------------------------------
+# Индикаторы вручную (как в live_signal.py)
+# ----------------------------------------------------------------------
+def calc_rsi(series, period=14):
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def calc_atr(high, low, close, period=14):
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, min_periods=period).mean()
+
+
+def calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def calc_macd_hist(series, fast=12, slow=26, signal=9):
+    ema_fast    = calc_ema(series, fast)
+    ema_slow    = calc_ema(series, slow)
+    macd_line   = ema_fast - ema_slow
+    signal_line = calc_ema(macd_line, signal)
+    return macd_line - signal_line
+
+
+# ----------------------------------------------------------------------
+# Сбор данных
+# ----------------------------------------------------------------------
 def fetch_mega_data(symbol="TON/USDT:USDT", timeframe="1h", limit=2000):
     print(f"📡 Сбор данных для {symbol} (2000 свечей)...")
     exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
@@ -36,21 +71,21 @@ def fetch_mega_data(symbol="TON/USDT:USDT", timeframe="1h", limit=2000):
         df_f['timestamp'] = pd.to_datetime(df_f['timestamp'], unit='ms')
         df_f.set_index('timestamp', inplace=True)
         df = df.join(df_f[['fundingRate']], how='left').ffill().fillna(0)
-    except:
+    except Exception:
         df['fundingRate'] = 0.0
 
-    # 4. Индикаторы
-    df['RSI']       = ta.rsi(df['Close'], length=14)
-    df['ATR']       = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-    df['EMA20']     = ta.ema(df['Close'], length=20)
-    df['MACD_Hist'] = ta.macd(df['Close']).iloc[:, 1]
-    df['Vol_Change']   = df['Volume'].pct_change() * 100
+    # 4. Индикаторы (вручную — без pandas_ta)
+    df['RSI']        = calc_rsi(df['Close'], 14)
+    df['ATR']        = calc_atr(df['High'], df['Low'], df['Close'], 14)
+    df['EMA20']      = calc_ema(df['Close'], 20)
+    df['MACD_Hist']  = calc_macd_hist(df['Close'])
+    df['Vol_Change'] = df['Volume'].pct_change() * 100
     df['High_Low_pct'] = (df['High'] - df['Low']) / df['Close'] * 100
 
-    # 5. Сигнал учителя
+    # 5. Сигнал учителя (RSI < 40)
     df['Primary_Signal'] = (df['RSI'] < 40).astype(int)
 
-    # 6. Таргет
+    # 6. Таргет: цена через 8 часов выше на 1.5%
     df['Target'] = 0
     df.loc[(df['Close'].shift(-8) > df['Close'] * 1.015), 'Target'] = 1
 
@@ -59,6 +94,9 @@ def fetch_mega_data(symbol="TON/USDT:USDT", timeframe="1h", limit=2000):
     return final_df
 
 
+# ----------------------------------------------------------------------
+# Обучение модели
+# ----------------------------------------------------------------------
 def train_model():
     """
     Обучает модель и сохраняет локально.
@@ -76,8 +114,10 @@ def train_model():
             print("⚠️ Мало сигналов RSI — обучаем на всём датасете")
             train_df = df
 
-        features = ['RSI', 'ATR', 'MACD_Hist', 'Vol_Change',
-                    'High_Low_pct', 'BTC_pct_1h', 'fundingRate']
+        features = [
+            'RSI', 'ATR', 'MACD_Hist', 'Vol_Change',
+            'High_Low_pct', 'BTC_pct_1h', 'fundingRate'
+        ]
         X = train_df[features]
         y = train_df['Target']
 
@@ -87,7 +127,9 @@ def train_model():
         )
 
         # Балансировка классов
-        scale = (len(y_train) - sum(y_train)) / sum(y_train) if sum(y_train) > 0 else 1
+        pos  = sum(y_train)
+        neg  = len(y_train) - pos
+        scale = neg / pos if pos > 0 else 1
 
         model = XGBClassifier(
             n_estimators=100,
@@ -106,20 +148,22 @@ def train_model():
         precision = precision_score(y_test, y_pred, zero_division=0)
         recall    = recall_score(y_test, y_pred, zero_division=0)
 
-        print(f"✅ Точность: {accuracy:.1%} | Precision: {precision:.1%} | Recall: {recall:.1%}")
+        print(f"✅ Точность:  {accuracy:.1%}")
+        print(f"✅ Precision: {precision:.1%}")
+        print(f"✅ Recall:    {recall:.1%}")
 
         # Сохраняем локально
         joblib.dump(model, MODEL_PATH)
         print(f"💾 Модель сохранена: {MODEL_PATH}")
 
         return {
-            "success":    True,
-            "model":      model,
-            "scaler":     None,
-            "accuracy":   accuracy,
-            "precision":  precision,
-            "recall":     recall,
-            "n_samples":  len(X_train),
+            "success":   True,
+            "model":     model,
+            "scaler":    None,
+            "accuracy":  accuracy,
+            "precision": precision,
+            "recall":    recall,
+            "n_samples": len(X_train),
         }
 
     except Exception as e:
